@@ -7,6 +7,8 @@ import pandas as pd
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 
 """
@@ -32,6 +34,11 @@ Session 2.1: Command Line Automation of HEC-RAS with Python
 | get_project_name | Extract the project name from the given project path. | project_path (Path) | str: The project name derived from the file name without extension |
 | get_next_available_number | Determine the first available number for plan, unsteady, steady, or geometry files from 01 to 99. | existing_numbers (pandas.Series) | str: First available number as a two-digit string |
 | copy_plan_from_template | Create a new plan file based on a template and update the project file. | project_folder (str), project_name (str), template_plan (str), new_plan_shortid (str, optional) | str: New plan number |
+| run_plans_parallel | Run HEC-RAS plans in parallel using ThreadPoolExecutor. | ras_plan_entries (pd.DataFrame), hecras_exe_path (str), project_file (str), max_workers (int), cores_per_run (int) | dict: Dictionary with plan numbers as keys and execution success as values |
+| set_num_cores | Update the maximum number of cores to use in the HEC-RAS plan file. | plan_file (str), num_cores (int) | None |
+| update_geompre_flags | Update the simulation plan file to modify the `Run HTab` and `UNET Use Existing IB Tables` settings. | file_path (str), run_htab_value (int), use_ib_tables_value (int) | None |
+
+
 
 Session 2.2: Modifying Unsteady Flow Hydrographs
 
@@ -697,6 +704,8 @@ class AwsRasTools:
 
         return f"p{new_plan_num}"
 
+
+
     @staticmethod
     def run_plans_parallel(ras_plan_entries, hecras_exe_path, project_file, max_workers, cores_per_run):
         """
@@ -711,6 +720,22 @@ class AwsRasTools:
         
         Returns:
         dict: Dictionary with plan numbers as keys and execution success as values
+        
+        Example:
+        ras_plan_entries = pd.DataFrame({
+            'plan_number': ['01', '02'],
+            'file_name': ['BaldEagle.p01', 'BaldEagle.p02'],
+            'full_path': ['C:\\AWS_Session_2\\Bald Eagle Creek\\BaldEagle.p01',
+                          'C:\\AWS_Session_2\\Bald Eagle Creek\\BaldEagle.p02']
+        })
+        hecras_exe_path = r"C:\Program Files (x86)\HEC\HEC-RAS\6.3\RAS.exe"
+        project_file = r"C:\AWS_Session_2\Bald Eagle Creek\BaldEagle.prj"
+        max_workers = 2
+        cores_per_run = 2
+        
+        results = AwsRasTools.run_plans_parallel(ras_plan_entries, hecras_exe_path, project_file, max_workers, cores_per_run)
+        print(results)
+        # Expected output: {'01': True, '02': True}
         """
         
         def run_single_plan(plan_row, test_folder_path):
@@ -792,7 +817,85 @@ class AwsRasTools:
             shutil.rmtree(test_folder)
             print(f"Moved and removed test folder: {test_folder}")
 
-        return results                    
+        return results    
+    
+                    
+    @staticmethod
+    def set_num_cores(plan_file, num_cores):
+        """
+        Update the maximum number of cores to use in the HEC-RAS plan file.
+        
+        Parameters:
+        plan_file (str): Full path to the plan file
+        num_cores (int): Maximum number of cores to use
+        
+        Returns:
+        None
+        """
+        d1_cores_pattern = re.compile(r"(UNET D1 Cores= )\d+")
+        d2_cores_pattern = re.compile(r"(UNET D2 Cores= )\d+")
+        ps_cores_pattern = re.compile(r"(PS Cores= )\d+")
+        
+        with open(plan_file, 'r') as file:
+            content = file.read()
+        
+        # First update D2 cores
+        new_content = d2_cores_pattern.sub(rf"\g<1>{num_cores}", content)
+        
+        # Check if D2 cores is 2, if so set others to 1, otherwise use num_cores
+        d2_match = d2_cores_pattern.search(new_content)
+        if d2_match and int(d2_match.group().split()[-1]) == 2:
+            new_content = d1_cores_pattern.sub(r"\g<1>1", new_content)
+            new_content = ps_cores_pattern.sub(r"\g<1>1", new_content)
+            print(f"Updated {plan_file} with 2 cores for D2 and 1 core for D1 and PS.")
+        else:
+            new_content = d1_cores_pattern.sub(rf"\g<1>{num_cores}", new_content)
+            new_content = ps_cores_pattern.sub(rf"\g<1>{num_cores}", new_content)
+            print(f"Updated {plan_file} with {num_cores} cores for D1, D2, and PS.")
+        
+        with open(plan_file, 'w') as file:
+            file.write(new_content)
+        
+        
+        
+    @staticmethod
+    def update_geompre_flags(file_path, run_htab_value, use_ib_tables_value):
+        """
+        Update the simulation plan file to modify the `Run HTab` and `UNET Use Existing IB Tables` settings.
+
+        Parameters:
+        file_path (str): Path to the simulation plan file (.p06 or similar) that you want to modify.
+        run_htab_value (int): Value for the `Run HTab` setting (0 or -1).
+        use_ib_tables_value (int): Value for the `UNET Use Existing IB Tables` setting (0 or -1).
+
+        Returns:
+        None
+        """
+        if run_htab_value not in [-1, 0]:
+            raise ValueError("Invalid value for `Run HTab`. Expected `0` or `-1`.")
+        if use_ib_tables_value not in [-1, 0]:
+            raise ValueError("Invalid value for `UNET Use Existing IB Tables`. Expected `0` or `-1`.")
+        
+        with open(file_path, 'r') as file:
+            lines = file.readlines()
+
+        updated_lines = []
+        for line in lines:
+            if line.strip().startswith("Run HTab="):
+                updated_line = f"Run HTab= {run_htab_value} \n"
+                updated_lines.append(updated_line)
+            elif line.strip().startswith("UNET Use Existing IB Tables="):
+                updated_line = f"UNET Use Existing IB Tables= {use_ib_tables_value} \n"
+                updated_lines.append(updated_line)
+            else:
+                updated_lines.append(line)
+        
+        with open(file_path, 'w') as file:
+            file.writelines(updated_lines)
+    
+    
+    
+    
                 
 # ---------------                 Functions from Session 2.2 Modifying Unsteady Flow Hydrographs              ---------------------------#
 
